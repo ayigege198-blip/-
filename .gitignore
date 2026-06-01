@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+build/
+dist/
+dist*/
+*.exe
+*.bin
+*.pkg
+*.log
+assets/*.exe
+assets/*.bin
+.env
+*.env
+ai_config*.json
