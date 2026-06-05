@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QCheckBox, QTabWidget, QTextEdit, QGroupBox,
     QMessageBox, QDialog, QListWidget, QListWidgetItem, QLineEdit,
-    QFormLayout, QFileDialog, QStackedWidget,
+    QFormLayout, QFileDialog, QStackedWidget, QScrollArea,
 )
 
 
@@ -24,6 +24,8 @@ from environment_diagnostics import (
     run_environment_diagnostics,
     run_environment_repair,
     run_environment_precheck,
+    scan_repairable_issues,
+    run_selected_repairs,
 )
 
 APP_NAME = "小傻瓜环境配置"
@@ -141,17 +143,26 @@ class PrecheckThread(QThread):
 
 
 class DiagnosticsThread(QThread):
-    result = pyqtSignal(str)
+    result = pyqtSignal(str, object)
 
     def run(self):
-        self.result.emit(run_environment_diagnostics())
+        text = run_environment_diagnostics()
+        try:
+            issues = scan_repairable_issues()
+        except Exception:  # noqa: BLE001 - 扫描失败不应中断诊断结果展示
+            issues = []
+        self.result.emit(text, issues)
 
 
 class RepairThread(QThread):
     result = pyqtSignal(str)
 
+    def __init__(self, keys, parent=None):
+        super().__init__(parent)
+        self.keys = keys
+
     def run(self):
-        self.result.emit(run_environment_repair())
+        self.result.emit(run_selected_repairs(self.keys))
 
 
 # ========== 单个软件行 ==========
@@ -245,6 +256,66 @@ class AboutDialog(QDialog):
         layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
 
 
+# ========== 修复项勾选对话框 ==========
+class RepairSelectionDialog(QDialog):
+    def __init__(self, issues: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择要修复的冲突项")
+        self.setMinimumWidth(560)
+        self.setMinimumHeight(360)
+        self._checks: list[tuple[QCheckBox, str]] = []
+
+        layout = QVBoxLayout(self)
+        tip = QLabel(
+            f"检测到 {len(issues)} 个可自动修复的冲突项，请勾选需要修复的项目，"
+            "然后点击“修复所选”。有效 API Key 与代理变量不会被处理。"
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(4, 4, 4, 4)
+        for issue in issues:
+            cb = QCheckBox(issue.get("label", issue.get("key", "")))
+            cb.setChecked(True)
+            box.addWidget(cb)
+            self._checks.append((cb, issue.get("key", "")))
+        box.addStretch(1)
+        scroll.setWidget(container)
+        layout.addWidget(scroll, 1)
+
+        sel_row = QHBoxLayout()
+        btn_all = QPushButton("全选")
+        btn_none = QPushButton("全不选")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        sel_row.addWidget(btn_all)
+        sel_row.addWidget(btn_none)
+        sel_row.addStretch(1)
+        layout.addLayout(sel_row)
+
+        action_row = QHBoxLayout()
+        action_row.addStretch(1)
+        btn_cancel = QPushButton("取消")
+        btn_fix = QPushButton("修复所选")
+        btn_fix.setDefault(True)
+        btn_cancel.clicked.connect(self.reject)
+        btn_fix.clicked.connect(self.accept)
+        action_row.addWidget(btn_cancel)
+        action_row.addWidget(btn_fix)
+        layout.addLayout(action_row)
+
+    def _set_all(self, checked: bool):
+        for cb, _ in self._checks:
+            cb.setChecked(checked)
+
+    def selected_keys(self) -> list[str]:
+        return [key for cb, key in self._checks if cb.isChecked() and key]
+
+
 # ========== 主窗口 ==========
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -255,6 +326,7 @@ class MainWindow(QMainWindow):
         self.rows: dict[str, SoftwareRow] = {}
         self.winget_ok = False
         self.winget_message = ""
+        self._repair_issues: list[dict] = []
 
         self._build_ui()
         self._apply_style()
@@ -803,28 +875,41 @@ class MainWindow(QMainWindow):
         self.diag_thread.result.connect(self._on_environment_diagnostics_done)
         self.diag_thread.start()
 
-    def _on_environment_diagnostics_done(self, text: str):
+    def _on_environment_diagnostics_done(self, text: str, issues: list):
         self.diag_box.setText(text)
         self.btn_run_diag.setEnabled(True)
         self.btn_repair_diag.setEnabled(True)
+        self._repair_issues = list(issues or [])
         self.log("[诊断] 环境冲突检测完成")
+        if self._repair_issues:
+            self.log(f"[诊断] 发现 {len(self._repair_issues)} 个可修复项，请在弹窗中勾选")
+            self._open_repair_selection_dialog()
+        else:
+            self.log("[诊断] 未发现可自动修复的冲突项")
 
     def _repair_environment_conflicts(self):
-        ret = QMessageBox.question(
-            self,
-            "确认一键修复",
-            "将自动修复低风险环境冲突：ExecutionPolicy、异常 Key 环境变量、Claude 临时下载残留、"
-            "Claude 配置中写死模型、Codex 大日志/大会话归档、Codex npm 与桌面端冲突、运行中进程占用。\n\n"
-            "如果 winget 已存在但命令行找不到，会把当前用户 WindowsApps 加入 PATH；如果系统确实缺少 winget，"
-            "会从微软 GitHub 官方发布页下载依赖包和 Microsoft App Installer，尽量解决没有 Microsoft Store 的电脑。\n\n"
-            "有效 API Key 和代理变量不会静默删除。继续吗？",
-        )
-        if ret != QMessageBox.StandardButton.Yes:
+        if not self._repair_issues:
+            QMessageBox.information(
+                self,
+                "暂无可修复项",
+                "尚未检测到可自动修复的冲突项。请先点击“开始检测环境冲突”，"
+                "检测完成后会弹出可勾选的修复列表。",
+            )
+            return
+        self._open_repair_selection_dialog()
+
+    def _open_repair_selection_dialog(self):
+        dialog = RepairSelectionDialog(self._repair_issues, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        keys = dialog.selected_keys()
+        if not keys:
+            QMessageBox.information(self, "未选择项目", "没有勾选任何修复项，已取消。")
             return
         self.btn_run_diag.setEnabled(False)
         self.btn_repair_diag.setEnabled(False)
-        self.diag_box.setText("正在一键修复环境冲突，请稍候 ...")
-        self.repair_thread = RepairThread()
+        self.diag_box.setText("正在修复所选环境冲突，请稍候 ...")
+        self.repair_thread = RepairThread(keys)
         self.repair_thread.result.connect(self._on_environment_repair_done)
         self.repair_thread.start()
 
@@ -832,7 +917,8 @@ class MainWindow(QMainWindow):
         self.diag_box.setText(text)
         self.btn_run_diag.setEnabled(True)
         self.btn_repair_diag.setEnabled(True)
-        self.log("[诊断] 环境冲突一键修复完成")
+        self._repair_issues = []
+        self.log("[诊断] 环境冲突修复完成，如需再次确认请重新检测")
 
     def _apply_style(self):
         self.setStyleSheet(f"""

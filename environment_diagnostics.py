@@ -895,6 +895,166 @@ def _install_winget_app_installer(lines: list[str]) -> bool:
     return False
 
 
+def _fix_winget(lines: list[str]) -> bool:
+    """winget 缺失/不可用时的修复组合：补 PATH → 重新注册 → 无商店安装 → 再补 PATH。"""
+    changed = False
+    for action in [
+        _ensure_windowsapps_on_user_path,
+        _register_existing_desktop_app_installer,
+        _install_winget_app_installer,
+        _ensure_windowsapps_on_user_path,
+    ]:
+        try:
+            if action(lines):
+                changed = True
+        except Exception as exc:  # noqa: BLE001 - repair should keep going.
+            _add(lines, "WARN", f"{action.__name__} 执行失败: {exc}")
+    return changed
+
+
+def _detect_winget() -> bool:
+    winget = find_winget()
+    if not winget:
+        return True
+    windowsapps = get_windowsapps_dir()
+    try:
+        on_path = bool(shutil.which("winget"))
+    except OSError:
+        on_path = True
+    return not on_path and _same_path(Path(winget).parent, windowsapps)
+
+
+def _detect_execution_policy() -> bool:
+    code, out = _run_powershell("Get-ExecutionPolicy -Scope CurrentUser", timeout=15)
+    policy = out.strip().splitlines()[0].strip() if code == 0 and out.strip() else ""
+    if not policy:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell") as key:
+                policy = winreg.QueryValueEx(key, "ExecutionPolicy")[0]
+        except OSError:
+            policy = "Undefined"
+    return policy in {"Restricted", "AllSigned", "Undefined", ""}
+
+
+def _detect_invalid_key_env() -> bool:
+    for key in CLAUDE_ENV_KEYS:
+        value = os.environ.get(key, "")
+        if not value or ("KEY" not in key and "TOKEN" not in key) or key == "CLAUDE_CODE_OAUTH_TOKEN":
+            continue
+        if not _looks_like_key(value, "anthropic"):
+            return True
+    for key in CODEX_ENV_KEYS:
+        value = os.environ.get(key, "")
+        if not value or "KEY" not in key:
+            continue
+        if not _looks_like_key(value, "openai"):
+            return True
+    return False
+
+
+def _detect_claude_settings() -> bool:
+    data = _read_json(Path.home() / ".claude" / "settings.json")
+    if not isinstance(data, dict):
+        return False
+    env = data.get("env")
+    if isinstance(env, dict) and "ANTHROPIC_MODEL" in env:
+        return True
+    return data.get("autoUpdatesChannel") not in (None, "stable")
+
+
+def _detect_claude_downloads() -> bool:
+    downloads = Path.home() / ".claude" / "downloads"
+    try:
+        return downloads.exists() and any(downloads.iterdir())
+    except OSError:
+        return False
+
+
+def _detect_codex_logs() -> bool:
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    sandbox_log = codex_home / ".sandbox" / "sandbox.log"
+    try:
+        if sandbox_log.exists() and sandbox_log.stat().st_size > 10 * 1024 * 1024:
+            return True
+    except OSError:
+        pass
+    try:
+        for path in codex_home.rglob("*.jsonl"):
+            if "archive-" in str(path):
+                continue
+            if path.stat().st_size > 50 * 1024 * 1024:
+                return True
+    except OSError:
+        pass
+    return False
+
+
+def _detect_npm_codex_conflict() -> bool:
+    npm_codex = Path(os.environ.get("APPDATA", "")) / "npm" / "node_modules" / "@openai" / "codex"
+    desktop_root = Path(r"C:\Program Files\WindowsApps")
+    desktop_codex = list(desktop_root.glob("OpenAI.Codex_*")) if desktop_root.exists() else []
+    return npm_codex.exists() and bool(desktop_codex)
+
+
+def _detect_ai_processes() -> bool:
+    code, out = _run(
+        "powershell -NoProfile -Command \"Get-Process | Where-Object { $_.ProcessName -match 'claude|codex' } | Select-Object -ExpandProperty ProcessName\"",
+        timeout=8,
+    )
+    return bool([x for x in out.splitlines() if x.strip()])
+
+
+_REPAIR_REGISTRY = [
+    {"key": "winget", "label": "安装/修复 winget（Microsoft App Installer）并补全 PATH", "detect": _detect_winget, "fix": _fix_winget},
+    {"key": "exec_policy", "label": "修复 PowerShell 执行策略（ExecutionPolicy）", "detect": _detect_execution_policy, "fix": _set_execution_policy},
+    {"key": "invalid_keys", "label": "清除无效的 API Key 环境变量", "detect": _detect_invalid_key_env, "fix": _clean_invalid_key_env},
+    {"key": "claude_settings", "label": "修复 ~/.claude/settings.json（写死模型 / 更新通道）", "detect": _detect_claude_settings, "fix": _fix_claude_settings},
+    {"key": "claude_downloads", "label": "清理 Claude 临时下载残留", "detect": _detect_claude_downloads, "fix": _clean_claude_downloads},
+    {"key": "codex_logs", "label": "归档过大的 Codex 日志与会话文件", "detect": _detect_codex_logs, "fix": _rotate_codex_logs_and_sessions},
+    {"key": "npm_codex", "label": "卸载与桌面端冲突的 npm Codex CLI", "detect": _detect_npm_codex_conflict, "fix": _uninstall_npm_codex_if_desktop_exists},
+    {"key": "ai_processes", "label": "关闭运行中的 Claude/Codex 进程", "detect": _detect_ai_processes, "fix": _kill_ai_processes},
+]
+
+
+def scan_repairable_issues() -> list[dict]:
+    """扫描当前存在、且可自动修复的冲突项，返回 [{key, label}]，供界面弹窗勾选。"""
+    issues: list[dict] = []
+    for entry in _REPAIR_REGISTRY:
+        try:
+            if entry["detect"]():
+                issues.append({"key": entry["key"], "label": entry["label"]})
+        except Exception:  # noqa: BLE001 - 单项检测失败不影响其它项
+            continue
+    return issues
+
+
+def run_selected_repairs(keys) -> str:
+    """只执行用户在弹窗中勾选的修复项，最后追加一次只读诊断。"""
+    selected = set(keys or [])
+    lines: list[str] = []
+    _add(lines, "INFO", "开始按所选项修复。会自动备份或移动可恢复文件。")
+    _add(lines, "INFO", "不会静默删除看起来有效的 API Key，也不会清理代理变量；这些需要人工确认。")
+    lines.append("")
+
+    changed = 0
+    for entry in _REPAIR_REGISTRY:
+        if entry["key"] not in selected:
+            continue
+        try:
+            if entry["fix"](lines):
+                changed += 1
+        except Exception as exc:  # noqa: BLE001 - repair should keep going.
+            _add(lines, "WARN", f"{entry['label']} 执行失败: {exc}")
+    lines.append("")
+    if changed:
+        _add(lines, "SUMMARY", f"修复完成，执行了 {changed} 类修复。建议关闭本程序后重新打开 PowerShell/终端再测试。")
+    else:
+        _add(lines, "SUMMARY", "所选项目没有需要实际修改的内容，或剩余项目需要手动确认。")
+    lines.append("")
+    lines.append(run_environment_diagnostics())
+    return "\n".join(lines)
+
+
 def run_environment_repair() -> str:
     lines: list[str] = []
     _add(lines, "INFO", "开始一键修复。会自动备份或移动可恢复文件。")
