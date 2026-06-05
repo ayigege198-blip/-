@@ -8,6 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable, Iterator
 
+from detector import find_winget
+
 
 WINGET_NO_APPLICABLE_UPDATE = 0x8A15002B
 WINGET_NO_APPLICABLE_UPDATE_SIGNED = WINGET_NO_APPLICABLE_UPDATE - 2**32
@@ -83,6 +85,17 @@ def _prepare_bundled_exe(source_path: Path, run_name: str) -> Path:
     return target_path
 
 
+def _verify_claude_installed() -> tuple[bool, str]:
+    """原生安装器把 claude.exe 放到 %USERPROFILE%\\.local\\bin;装完当前进程 PATH 还没刷新,直接查这个路径最可靠。"""
+    local_bin = Path(os.path.expanduser("~")) / ".local" / "bin" / "claude.exe"
+    if local_bin.exists():
+        return True, str(local_bin)
+    found = shutil.which("claude")
+    if found:
+        return True, found
+    return False, ""
+
+
 def install_stream(install_cfg: dict) -> Iterator[str]:
     """
     根据 install 配置安装,逐行 yield 日志。
@@ -91,8 +104,16 @@ def install_stream(install_cfg: dict) -> Iterator[str]:
     """
     itype = install_cfg.get("type")
     if itype == "winget":
+        winget = find_winget()
+        if not winget:
+            yield "[错误] 当前系统未检测到 winget，无法使用一键安装。"
+            yield "[原因] winget 由 Microsoft App Installer 提供；常见于精简版 Windows、企业镜像、旧系统或 PATH 未刷新。"
+            yield "[修复] 进入“环境冲突检测”点击“一键修复检测到的问题”，工具会优先补 WindowsApps 到 PATH，仍没有时走无商店安装 App Installer。"
+            yield "[手动] 有 Microsoft Store 时可搜索“应用安装程序 / App Installer”；没有商店时请用一键修复的无商店安装。"
+            yield "[备用] 也可以先手动安装 Windows Terminal、PowerShell、Git、Node.js、Python 后再运行检测。"
+            return
         cmd = (
-            f'winget install --id "{install_cfg["id"]}" --exact '
+            f'"{winget}" install --id "{install_cfg["id"]}" --exact '
             f'--silent --accept-package-agreements --accept-source-agreements '
             f'--disable-interactivity'
         )
@@ -100,6 +121,11 @@ def install_stream(install_cfg: dict) -> Iterator[str]:
     elif itype == "npm":
         cmd = f'npm install -g {install_cfg["package"]}'
         target = install_cfg["package"]
+    elif itype == "native_script":
+        target = install_cfg.get("name", "安装项")
+        ps = shutil.which("pwsh") or shutil.which("powershell") or "powershell"
+        script = install_cfg["script"]
+        cmd = f'"{ps}" -NoProfile -ExecutionPolicy Bypass -Command "{script}"'
     elif itype == "bundled_exe":
         exe_path = _resource_path(install_cfg["path"])
         run_name = install_cfg.get("run_name") or exe_path.with_suffix(".exe").name
@@ -148,7 +174,16 @@ def install_stream(install_cfg: dict) -> Iterator[str]:
         yield line
 
     proc.wait()
-    if proc.returncode == 0:
+    if itype == "native_script":
+        ok, where = _verify_claude_installed()
+        if ok:
+            yield f"[完成] {target} 安装成功:{where}"
+            yield "[提示] 请关闭并重新打开终端,使 PATH 生效后即可使用 claude 命令。"
+        else:
+            yield f"[失败] {target} 安装后未检测到 claude(退出码 {proc.returncode})。"
+            yield "[原因] 可能无法访问 claude.ai(需代理/VPN),或脚本被网络拦截。"
+            yield "[手动] 在 PowerShell 中运行:irm https://claude.ai/install.ps1 | iex"
+    elif proc.returncode == 0:
         yield f"[完成] {target} 安装/更新成功"
     elif itype == "winget" and _winget_no_update(proc.returncode, "\n".join(output_lines)):
         yield f"[完成] {target} 已安装,当前没有可用更新"

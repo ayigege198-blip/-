@@ -17,10 +17,14 @@ def resource_path(rel: str) -> str:
     return os.path.join(base, rel)
 
 from software_config import CORE_STACK, EXTERNAL_TOOLS, AI_TOOLS
-from detector import detect, check_winget_available
+from detector import detect
 from installer import install_stream
 import ai_config
-from environment_diagnostics import run_environment_diagnostics, run_environment_repair
+from environment_diagnostics import (
+    run_environment_diagnostics,
+    run_environment_repair,
+    run_environment_precheck,
+)
 
 APP_NAME = "小傻瓜环境配置"
 APP_VERSION = "0.1.0"
@@ -125,6 +129,15 @@ class InstallThread(QThread):
                     success = True
             self.item_done.emit(item["key"], success)
         self.finished_all.emit()
+
+
+class PrecheckThread(QThread):
+    log = pyqtSignal(str)
+    done = pyqtSignal(bool, str)  # winget_ok, winget_version
+
+    def run(self):
+        ok, ver = run_environment_precheck(self.log.emit)
+        self.done.emit(ok, ver)
 
 
 class DiagnosticsThread(QThread):
@@ -240,12 +253,14 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(create_pig_icon(64))
         self.resize(1000, 760)
         self.rows: dict[str, SoftwareRow] = {}
+        self.winget_ok = False
+        self.winget_message = ""
 
         self._build_ui()
         self._apply_style()
 
-        self.log("正在扫描当前系统环境 ...")
-        self._check_winget()
+        self.log("正在扫描当前系统环境...")
+        self._start_precheck()
         self._start_detect()
 
     def _build_ui(self):
@@ -355,7 +370,7 @@ class MainWindow(QMainWindow):
             "注意事项：\n"
             "• 建议右键以管理员身份运行本工具。\n"
             "• 已安装项目默认取消勾选，避免重复安装。\n"
-            "• 开源版不包含第三方安装器，如需打包内置安装器，请自行放入 assets 目录。"
+            "• Codex 和 Claude 桌面版安装器已内置在本程序中。"
         )
         guide.setWordWrap(True)
         guide.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px; line-height: 1.55;")
@@ -517,9 +532,8 @@ class MainWindow(QMainWindow):
         env_map = item.get("env_map", {})
         self.ed_timeout.setEnabled(bool(env_map.get("timeout")))
 
-        # 仅 Claude Code 支持"跳过登录"
-        is_claude = item.get("key") == "claude_code"
-        self.btn_skip_login.setVisible(is_claude)
+        # Claude Code 和 Claude 桌面版都支持"跳过登录"
+        self.btn_skip_login.setVisible(item.get("key") in ("claude_code", "claude_desktop_config"))
 
         # 状态
         srow = self.rows.get(item["key"])
@@ -542,8 +556,25 @@ class MainWindow(QMainWindow):
         item = self._current_ai_item()
         if not item:
             return
-        ai_config.set_config(item["key"], self._collect_form())
+        cfg = self._collect_form()
+        ai_config.set_config(item["key"], cfg)
         self.log(f"[配置] {item['name']} 已保存")
+        if item.get("key") == "claude_code":
+            try:
+                actions = ai_config.apply_claude_code_config(cfg)
+                for act in actions:
+                    self.log(f"[强制配置] {act}")
+                QMessageBox.information(
+                    self, "已强制配置",
+                    "已将 Claude Code 配置强制写入,确保不被其它软件覆盖:\n\n"
+                    + "\n".join("· " + a for a in actions)
+                    + "\n\n请重新打开终端 / Claude Code 使其生效。",
+                )
+            except ValueError as e:
+                QMessageBox.warning(self, "缺少信息", str(e))
+            except OSError as e:
+                QMessageBox.warning(self, "配置失败", str(e))
+            return
         QMessageBox.information(self, "已保存", f"{item['name']} 配置已保存")
 
     def _install_current_ai(self):
@@ -578,18 +609,41 @@ class MainWindow(QMainWindow):
 
     def _skip_login_current_ai(self):
         item = self._current_ai_item()
-        if not item or item.get("key") != "claude_code":
+        if not item:
             return
-        try:
-            path = ai_config.bypass_claude_onboarding()
-            self.log(f"[跳过登录] 已写入 hasCompletedOnboarding=true 到 {path}")
-            QMessageBox.information(
-                self, "已跳过登录",
-                f"已在 {path} 中设置 hasCompletedOnboarding=true。\n"
-                f"下次启动 Claude Code 将不再要求登录引导。",
-            )
-        except OSError as e:
-            QMessageBox.warning(self, "操作失败", str(e))
+        key = item.get("key")
+        if key == "claude_code":
+            try:
+                path = ai_config.bypass_claude_onboarding()
+                self.log(f"[跳过登录] 已写入 hasCompletedOnboarding=true 到 {path}")
+                QMessageBox.information(
+                    self, "已跳过登录",
+                    f"已在 {path} 中设置 hasCompletedOnboarding=true。\n"
+                    f"下次启动 Claude Code 将不再要求登录引导。",
+                )
+            except OSError as e:
+                QMessageBox.warning(self, "操作失败", str(e))
+        elif key == "claude_desktop_config":
+            cfg = self._collect_form()
+            try:
+                path = ai_config.bypass_claude_desktop_login(
+                    cfg.get("base_url", ""), cfg.get("api_key", "")
+                )
+                ai_config.set_config(key, cfg)  # 顺手保存当前填写
+                self.log(f"[跳过登录] 已写入 Claude 桌面版 Gateway 托管配置到 {path}")
+                QMessageBox.information(
+                    self, "已跳过登录",
+                    "已为 Claude 桌面版写入开发者模式 Gateway 托管配置：\n"
+                    f"{path}\n\n"
+                    "（Connection=Gateway，已勾选 Skip login-mode chooser，"
+                    "启动直接进入第三方推理模式，跳过登录。）\n\n"
+                    "请完全退出 Claude 桌面版（右键托盘图标 → 退出）后重新打开生效。\n"
+                    "如需恢复官方登录，删除上述注册表项即可。",
+                )
+            except ValueError as e:
+                QMessageBox.warning(self, "缺少信息", str(e))
+            except OSError as e:
+                QMessageBox.warning(self, "操作失败", str(e))
 
     def _launch_current_ai(self):
         item = self._current_ai_item()
@@ -607,6 +661,12 @@ class MainWindow(QMainWindow):
         cfg = self._collect_form()
         # 顺手保存
         ai_config.set_config(item["key"], cfg)
+        if item.get("key") == "claude_code":
+            try:
+                for act in ai_config.apply_claude_code_config(cfg):
+                    self.log(f"[强制配置] {act}")
+            except (ValueError, OSError) as e:
+                self.log(f"[强制配置] 已跳过: {e}")
         try:
             launch_target = item.get("launch") or item.get("launch_cmd")
             ai_config.launch_ai(launch_target, item.get("env_map", {}), cfg)
@@ -640,12 +700,17 @@ class MainWindow(QMainWindow):
     def log(self, msg: str):
         self.log_box.append(msg)
 
-    def _check_winget(self):
-        ok, ver = check_winget_available()
-        if ok:
-            self.log(f"winget 版本检查通过: v{ver}")
-        else:
-            self.log("[警告] 未检测到 winget,无法安装软件")
+    def _start_precheck(self):
+        self.precheck_thread = PrecheckThread()
+        self.precheck_thread.log.connect(self.log)
+        self.precheck_thread.done.connect(self._on_precheck_done)
+        self.precheck_thread.start()
+
+    def _on_precheck_done(self, ok: bool, ver: str):
+        self.winget_ok = ok
+        self.winget_message = ver
+        if not ok:
+            self.log("[提示] winget 仍不可用，依赖 winget 的项目可在“环境冲突检测”里点击“一键修复”。")
 
     def _start_detect(self):
         all_items = list(CORE_STACK) + list(EXTERNAL_TOOLS) + list(AI_TOOLS)
@@ -680,6 +745,25 @@ class MainWindow(QMainWindow):
         selected = [it for it in items if self.rows[it["key"]].is_checked()]
         if not selected:
             QMessageBox.information(self, "提示", "请至少勾选一个软件。")
+            return
+
+        winget_items = [it for it in selected if it.get("install", {}).get("type") == "winget"]
+        if winget_items and not self.winget_ok:
+            names = "、".join(it["name"] for it in winget_items)
+            QMessageBox.warning(
+                self,
+                "缺少 winget，无法继续",
+                "当前电脑没有检测到 winget，所以不能一键安装这些项目：\n\n"
+                f"{names}\n\n"
+                "winget 由 Microsoft App Installer 提供。请按下面步骤修复：\n"
+                "1. 切换到“环境冲突检测”。\n"
+                "2. 点击“一键修复检测到的问题”。\n"
+                "3. 工具会先把当前用户 WindowsApps 补进 PATH；如果仍没有 winget，会走无商店安装，"
+                "从微软 GitHub 官方发布页下载依赖包和 App Installer。\n\n"
+                "手动修复也可以打开 Microsoft Store，搜索“应用安装程序”或“App Installer”；没有商店的系统请使用一键修复的无商店安装。\n\n"
+                "如果这台电脑无法使用 Microsoft Store 或企业策略禁用 App Installer，请先手动安装上述软件，再回到本工具做检测/配置。"
+            )
+            self.log("[中止] 缺少 winget，已阻止继续执行 winget 安装命令，避免刷屏失败。")
             return
 
         # 提示已安装的会跳过(实际上 winget install 已装的会直接跳过)
@@ -731,6 +815,8 @@ class MainWindow(QMainWindow):
             "确认一键修复",
             "将自动修复低风险环境冲突：ExecutionPolicy、异常 Key 环境变量、Claude 临时下载残留、"
             "Claude 配置中写死模型、Codex 大日志/大会话归档、Codex npm 与桌面端冲突、运行中进程占用。\n\n"
+            "如果 winget 已存在但命令行找不到，会把当前用户 WindowsApps 加入 PATH；如果系统确实缺少 winget，"
+            "会从微软 GitHub 官方发布页下载依赖包和 Microsoft App Installer，尽量解决没有 Microsoft Store 的电脑。\n\n"
             "有效 API Key 和代理变量不会静默删除。继续吗？",
         )
         if ret != QMessageBox.StandardButton.Yes:

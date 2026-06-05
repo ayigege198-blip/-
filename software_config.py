@@ -89,7 +89,11 @@ AI_TOOLS = [
         "name": "Claude Code",
         "desc": "Anthropic 官方 CLI 编码助手",
         "detect": {"type": "command", "cmd": "claude --version"},
-        "install": {"type": "npm", "package": "@anthropic-ai/claude-code"},
+        "install": {
+            "type": "native_script",
+            "name": "Claude Code",
+            "script": "try { npm uninstall -g @anthropic-ai/claude-code } catch {}; irm https://claude.ai/install.ps1 | iex",
+        },
         "env_map": {
             "api_key": "ANTHROPIC_AUTH_TOKEN",
             "base_url": "ANTHROPIC_BASE_URL",

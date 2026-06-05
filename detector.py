@@ -2,12 +2,115 @@
 import subprocess
 import re
 import os
+import shutil
 from pathlib import Path
+
+
+def get_windowsapps_dir() -> Path:
+    """当前用户的 WindowsApps 目录；winget 的命令别名通常在这里。"""
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        return Path(local_appdata) / "Microsoft" / "WindowsApps"
+    return Path.home() / "AppData" / "Local" / "Microsoft" / "WindowsApps"
+
+
+_WINGET_CACHE = None  # None=未计算, ""=确认不可用, str=可用的 winget 路径
+
+WINGET_MIN_VERSION = "1.12.350"  # 低于此版本视为过低，预检查会自动更新
+
+
+def _version_tuple(text: str):
+    """从文本里抽出版本号转成可比较的元组；抽不到返回 None。"""
+    m = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?", text or "")
+    if not m:
+        return None
+    return tuple(int(g) if g else 0 for g in m.groups())
+
+
+def winget_meets_minimum(version: str, minimum: str = WINGET_MIN_VERSION) -> bool:
+    """winget 版本号是否 >= 最低要求。"""
+    current = _version_tuple(version)
+    if current is None:
+        return False
+    return current >= _version_tuple(minimum)
+
+
+def reset_winget_cache() -> None:
+    """清掉 winget 探测缓存，安装/升级后需要重新检测时调用。"""
+    global _WINGET_CACHE
+    _WINGET_CACHE = None
+
+
+def _winget_runs(path: str) -> bool:
+    """确认这个 winget 路径真的能执行。
+
+    精简版/无商店 Windows 上，WindowsApps 里常残留一个 winget.exe 执行别名存根：
+    文件存在(shutil.which/exists 都为真)，但实际运行会报“不是内部或外部命令”或弹商店。
+    只有 `--version` 真正返回 0 才算可用，否则视为没有 winget。
+    """
+    try:
+        result = subprocess.run(
+            f'"{path}" --version',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=8,
+            encoding="utf-8",
+            errors="ignore",
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+        return result.returncode == 0 and bool((result.stdout or "").strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+def find_winget() -> str:
+    """找到一个真正能用的 winget.exe；找不到返回 ""（结果会缓存）。"""
+    global _WINGET_CACHE
+    if _WINGET_CACHE is not None:
+        return _WINGET_CACHE
+
+    candidates: list[str] = []
+    found = shutil.which("winget")
+    if found:
+        candidates.append(found)
+    candidates.append(str(get_windowsapps_dir() / "winget.exe"))
+
+    windows_apps = Path(r"C:\Program Files\WindowsApps")
+    if windows_apps.exists():
+        try:
+            matches = sorted(
+                windows_apps.glob("Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe/winget.exe"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            candidates.extend(str(m) for m in matches)
+        except OSError:
+            pass
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if not Path(candidate).exists():
+            continue
+        if _winget_runs(candidate):
+            _WINGET_CACHE = candidate
+            return candidate
+
+    _WINGET_CACHE = ""
+    return ""
 
 
 def _run(cmd: str, timeout: int = 8) -> tuple[int, str]:
     """执行命令,返回 (returncode, stdout+stderr)。失败返回 (-1, '')。"""
     try:
+        if cmd.strip().lower().startswith("winget "):
+            winget = find_winget()
+            if not winget:
+                return -1, "未检测到 winget。请安装/修复 Microsoft App Installer，或从 Microsoft Store 更新“应用安装程序”。"
+            cmd = f'"{winget}" {cmd.strip()[len("winget "):]}'
         result = subprocess.run(
             cmd,
             shell=True,
@@ -116,7 +219,13 @@ def detect(item: dict) -> tuple[bool, str]:
 
 def check_winget_available() -> tuple[bool, str]:
     """检查 winget 本身是否可用"""
-    return detect_by_command("winget --version")
+    winget = find_winget()
+    if not winget:
+        return False, "未检测到 winget。请安装/修复 Microsoft App Installer。"
+    code, out = _run("winget --version")
+    if code == 0 and out.strip():
+        return True, _extract_version(out)
+    return False, out.strip() or "winget 无法正常运行"
 
 
 if __name__ == "__main__":
