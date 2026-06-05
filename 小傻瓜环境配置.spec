@@ -1,18 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
-from pathlib import Path
-
-datas = []
-for asset_name in ('Codex Installer.bin', 'Claude Setup.bin'):
-    asset_path = Path('assets') / asset_name
-    if asset_path.exists():
-        datas.append((str(asset_path), 'assets'))
 
 
 a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=datas,
+    datas=[('assets/Codex Installer.bin', 'assets'), ('assets/Claude Setup.bin', 'assets')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -33,7 +26,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
@@ -43,4 +36,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    version='version.txt',
 )

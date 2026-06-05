@@ -1,7 +1,6 @@
 """环境冲突诊断:只读扫描 Claude/Codex 常见配置失败原因。"""
 from __future__ import annotations
 
-import base64
 import json
 import locale
 import os
@@ -9,6 +8,7 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import urllib.error
 import urllib.request
 import winreg
@@ -89,16 +89,25 @@ def _run(cmd: str, timeout: int = 8) -> tuple[int, str]:
 
 
 def _run_powershell(script: str, timeout: int = 60) -> tuple[int, str]:
-    encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
-    cmd = subprocess.list2cmdline([
-        "powershell",
-        "-NoProfile",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        encoded,
-    ])
-    return _run(cmd, timeout=timeout)
+    # 用临时 .ps1 文件 + -File 执行，避免 -EncodedCommand(base64) 触发杀软行为告警。
+    fd, path = tempfile.mkstemp(suffix=".ps1", prefix="xsg_")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as handle:
+            handle.write(script)
+        cmd = subprocess.list2cmdline([
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            path,
+        ])
+        return _run(cmd, timeout=timeout)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 def _mask_value(value: str) -> str:
