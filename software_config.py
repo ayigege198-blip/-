@@ -92,7 +92,7 @@ AI_TOOLS = [
         "install": {
             "type": "native_script",
             "name": "Claude Code",
-            "script": "try { npm uninstall -g @anthropic-ai/claude-code } catch {}; irm https://claude.ai/install.ps1 | iex",
+            "script": "try { npm uninstall -g @anthropic-ai/claude-code } catch {}; try { $s = irm 'https://claude.ai/install.ps1' } catch { Write-Error ('无法访问 claude.ai: ' + $_.Exception.Message); exit 1 }; if ($s -is [string] -and $s.TrimStart() -match '(?i)^<(!doctype|html)') { Write-Error 'claude.ai 返回的是网页而非安装脚本，可能被网络拦截，请连接代理或 VPN 后重试'; exit 1 }; iex $s",
         },
         "env_map": {
             "api_key": "ANTHROPIC_AUTH_TOKEN",

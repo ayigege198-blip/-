@@ -5,7 +5,7 @@ a = Analysis(
     ['main.py'],
     pathex=[],
     binaries=[],
-    datas=[('assets/Codex Installer.bin', 'assets'), ('assets/Claude Setup.bin', 'assets')],
+    datas=[('assets/Codex Installer.bin', 'assets'), ('assets/Claude Setup.bin', 'assets'), ('icon.ico', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,5 +36,6 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     uac_admin=True,
+    icon='icon.ico',
     version='version.txt',
 )

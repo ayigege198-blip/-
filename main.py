@@ -1,7 +1,7 @@
 """小傻瓜环境配置 - 主程序(马卡龙配色 + 粉猪图标)"""
 import sys
 import os
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QRectF
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QRectF, QTimer
 from PyQt6.QtGui import QFont, QIcon, QPixmap, QPainter, QBrush, QColor, QPen
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -92,6 +92,16 @@ def create_pig_icon(size: int = 64) -> QIcon:
 
     p.end()
     return QIcon(pix)
+
+
+def load_app_icon() -> QIcon:
+    """优先用打包内置的 icon.ico(粉猪图片)作为程序图标，找不到再退回代码绘制的图标。"""
+    path = resource_path("icon.ico")
+    if os.path.exists(path):
+        icon = QIcon(path)
+        if not icon.isNull():
+            return icon
+    return create_pig_icon(64)
 
 
 # ========== 后台线程 ==========
@@ -240,13 +250,34 @@ class AboutDialog(QDialog):
         head.addStretch()
         layout.addLayout(head)
 
-        # 版本信息
+        # 版本与作者
         info = QLabel(
             f"<p style='margin:4px 0;'>版本:{APP_VERSION}</p>"
+            f"<p style='margin:4px 0;'>作者:paimingqian10</p>"
             f"<p style='margin:4px 0;color:{COLOR_TEXT_DIM};'>一个干净的 Windows 开发环境一键配置工具</p>"
         )
         info.setStyleSheet("font-size: 13px;")
         layout.addWidget(info)
+
+        # 二维码
+        qr_label = QLabel()
+        qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        qr_path = resource_path("111.png")
+        if os.path.exists(qr_path):
+            pix = QPixmap(qr_path)
+            if not pix.isNull():
+                pix = pix.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio,
+                                 Qt.TransformationMode.SmoothTransformation)
+                qr_label.setPixmap(pix)
+        qr_label.setStyleSheet(
+            f"background: white; border: 1.5px solid {COLOR_BORDER}; border-radius: 8px; padding: 8px;"
+        )
+        layout.addWidget(qr_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        tip = QLabel("扫一扫,联系作者")
+        tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tip.setStyleSheet(f"color: {COLOR_TEXT_DIM}; font-size: 11px;")
+        layout.addWidget(tip)
 
         layout.addStretch()
 
@@ -321,7 +352,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setWindowIcon(create_pig_icon(64))
+        self.setWindowIcon(load_app_icon())
         self.resize(1000, 760)
         self.rows: dict[str, SoftwareRow] = {}
         self.winget_ok = False
@@ -334,6 +365,9 @@ class MainWindow(QMainWindow):
         self.log("正在扫描当前系统环境...")
         self._start_precheck()
         self._start_detect()
+
+        # 窗口渲染后弹出使用顺序引导
+        QTimer.singleShot(0, self._show_startup_guide)
 
     def _build_ui(self):
         central = QWidget()
@@ -367,9 +401,9 @@ class MainWindow(QMainWindow):
 
         # ----- Tabs -----
         self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_tab_diagnostics(), "  环境冲突检测  ")
         self.tabs.addTab(self._build_tab1(), "  通用工具与程序  ")
         self.tabs.addTab(self._build_tab_ai(), "  AI 助手一键配置  ")
-        self.tabs.addTab(self._build_tab_diagnostics(), "  环境冲突检测  ")
         self.tabs.currentChanged.connect(self._on_tab_changed)
         root.addWidget(self.tabs, stretch=3)
 
@@ -389,6 +423,9 @@ class MainWindow(QMainWindow):
         self.log_box.setFont(QFont("Consolas", 9))
         self.log_box.setMinimumHeight(160)
         root.addWidget(self.log_box, stretch=2)
+
+        # 初始停在“环境冲突检测”页(index 0)，同步底部安装按钮的显隐
+        self._on_tab_changed(self.tabs.currentIndex())
 
     def _build_tab1(self) -> QWidget:
         tab = QWidget()
@@ -422,7 +459,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(left_box, stretch=3)
 
-        guide_box = QGroupBox("工具使用简介")
+        guide_box = QGroupBox("工具使用简介 / 作者联系方式")
         guide_layout = QVBoxLayout(guide_box)
         guide_layout.setContentsMargins(16, 18, 16, 16)
         guide_layout.setSpacing(12)
@@ -442,7 +479,8 @@ class MainWindow(QMainWindow):
             "注意事项：\n"
             "• 建议右键以管理员身份运行本工具。\n"
             "• 已安装项目默认取消勾选，避免重复安装。\n"
-            "• Codex 和 Claude 桌面版安装器已内置在本程序中。"
+            "• Codex 和 Claude 桌面版安装器已内置在本程序中。\n\n"
+            "作者联系方式：QQ 3995697915"
         )
         guide.setWordWrap(True)
         guide.setStyleSheet(f"color: {COLOR_TEXT}; font-size: 12px; line-height: 1.55;")
@@ -800,15 +838,16 @@ class MainWindow(QMainWindow):
             self._on_ai_selected(self.ai_list.currentRow())
 
     def _on_tab_changed(self, idx: int):
-        if idx == 0:
+        if idx == 1:
+            # “通用工具与程序”页才显示底部一键安装按钮
             self.btn_install.setText("🐷  开始一键配置 - 通用工具")
             self.btn_install.show()
         else:
-            # AI / 诊断 Tab 有自己的按钮,隐藏底部主按钮
+            # 诊断 / AI Tab 有自己的按钮,隐藏底部主按钮
             self.btn_install.hide()
 
     def _current_items(self) -> list:
-        if self.tabs.currentIndex() == 0:
+        if self.tabs.currentIndex() == 1:
             return list(CORE_STACK) + list(EXTERNAL_TOOLS)
         return list(AI_TOOLS)
 
@@ -863,6 +902,17 @@ class MainWindow(QMainWindow):
         self.btn_install.setEnabled(True)
         self.btn_install.setText(original_text)
         self.log("\n======= 全部处理完成 =======")
+
+    def _show_startup_guide(self):
+        QMessageBox.information(
+            self,
+            "使用顺序提示",
+            "建议按以下顺序使用本工具：\n\n"
+            "第 1 步：先到「环境冲突检测」检测并修复 Key 污染、模型错乱等冲突。\n\n"
+            "第 2 步：再到「通用工具与程序」安装依赖环境（Node.js、Git 等）。\n\n"
+            "第 3 步：最后到「AI 助手一键配置」填写并配置 Claude Code、Codex 等。\n\n"
+            "按这个顺序使用，能最大程度避免配置失败。",
+        )
 
     def _show_about(self):
         AboutDialog(self).exec()
@@ -1018,7 +1068,7 @@ class MainWindow(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    app.setWindowIcon(create_pig_icon(64))
+    app.setWindowIcon(load_app_icon())
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

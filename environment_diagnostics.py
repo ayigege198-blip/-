@@ -461,6 +461,25 @@ def check_network(timeout: int = 6) -> tuple[bool, str]:
     return False, "受限"
 
 
+def check_github(timeout: int = 6) -> bool:
+    """单独探测 github.com 是否可达。
+
+    winget 安装的每个包(Terminal/PowerShell/Git...)和 Claude 安装脚本都从 GitHub
+    下载，能否上网(bing/google 通)并不代表能下载。GitHub 被墙时 winget 会报
+    0x80072efd(InternetOpenUrl failed)，所以必须单独检测这个真实下载源。
+    """
+    for url in ("https://github.com", "https://codeload.github.com"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=timeout):
+                return True
+        except urllib.error.HTTPError:
+            return True  # 有 HTTP 响应即代表可达
+        except (urllib.error.URLError, socket.timeout, OSError):
+            continue
+    return False
+
+
 def _precheck_install_or_update_winget() -> bool:
     """winget 缺失或过低时安装/升级，返回最终是否可用。"""
     winget = find_winget()
@@ -514,10 +533,15 @@ def run_environment_precheck(emit) -> tuple[bool, str]:
 
     emit("正在检测网络环境...")
     net_ok, _ = check_network()
-    if net_ok:
-        emit("✅ 网络环境良好，可直接访问")
+    github_ok = check_github()
+    if github_ok:
+        emit("✅ 网络环境良好，可直接访问 GitHub 下载源")
+    elif net_ok:
+        emit("⚠ 可以上网，但无法访问 GitHub 下载源")
+        emit("⚠ winget(Terminal/PowerShell/Git)和 Claude 的安装包都从 GitHub 下载")
+        emit("⚠ 直接安装很可能失败并提示 0x80072efd，请先连接代理 / VPN 再安装")
     else:
-        emit("⚠ 网络受限，访问 GitHub / AI 服务可能需要代理或 VPN")
+        emit("⚠ 网络受限，访问 GitHub / AI 服务需要代理或 VPN")
 
     emit("✅ 环境预检查完成")
     return winget_ok, winget_ver

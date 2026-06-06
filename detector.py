@@ -41,65 +41,86 @@ def reset_winget_cache() -> None:
     _WINGET_CACHE = None
 
 
-def _winget_runs(path: str) -> bool:
+def _winget_runs(path: str, timeout: int = 20) -> bool:
     """确认这个 winget 路径真的能执行。
 
     精简版/无商店 Windows 上，WindowsApps 里常残留一个 winget.exe 执行别名存根：
     文件存在(shutil.which/exists 都为真)，但实际运行会报“不是内部或外部命令”或弹商店。
     只有 `--version` 真正返回 0 才算可用，否则视为没有 winget。
+
+    禁用更新/精简系统上首次冷启动很慢，超时设 20s 并重试一次，避免把“慢”误判成“没有”。
     """
-    try:
-        result = subprocess.run(
-            f'"{path}" --version',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=8,
-            encoding="utf-8",
-            errors="ignore",
-            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
-        )
-        return result.returncode == 0 and bool((result.stdout or "").strip())
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-        return False
+    for _ in range(2):
+        try:
+            result = subprocess.run(
+                f'"{path}" --version',
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+            if result.returncode == 0 and (result.stdout or "").strip():
+                return True
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass
+    return False
 
 
 def find_winget() -> str:
-    """找到一个真正能用的 winget.exe；找不到返回 ""（结果会缓存）。"""
+    """找到一个真正能用的 winget.exe；找不到返回 ""。
+
+    只缓存“已确认可用的路径”和“确认磁盘上根本没有 winget.exe”两种状态。
+    若 exe 存在但本次 --version 没跑通(精简版/禁用更新时冷启动很慢甚至超时)，
+    不写永久缓存，下次检测会重试，避免把一次“慢”永久误判成“没装”。
+    """
     global _WINGET_CACHE
-    if _WINGET_CACHE is not None:
+    if _WINGET_CACHE:  # 只信任已确认可用的缓存路径
         return _WINGET_CACHE
 
-    candidates: list[str] = []
-    found = shutil.which("winget")
-    if found:
-        candidates.append(found)
-    candidates.append(str(get_windowsapps_dir() / "winget.exe"))
-
+    # 1) C:\Program Files\WindowsApps 里的真实包二进制：存在即代表 winget 已安装。
+    #    这是最权威的信号，不依赖能否运行(禁用更新时运行慢/弹商店但 winget 仍在)。
+    #    去掉架构限定(_x64/_arm64/_x86 都匹配)。
     windows_apps = Path(r"C:\Program Files\WindowsApps")
     if windows_apps.exists():
         try:
-            matches = sorted(
-                windows_apps.glob("Microsoft.DesktopAppInstaller_*_x64__8wekyb3d8bbwe/winget.exe"),
+            package_bins = sorted(
+                windows_apps.glob("Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe/winget.exe"),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
-            candidates.extend(str(m) for m in matches)
+            for binary in package_bins:
+                _WINGET_CACHE = str(binary)
+                return _WINGET_CACHE
         except OSError:
-            pass
+            pass  # WindowsApps 可能因 ACL 不可读，退回别名探测
 
+    # 2) PATH / 用户 WindowsApps 里的别名存根：必须真正能运行才算数(存根可能是死链)。
+    alias_candidates: list[str] = []
+    found = shutil.which("winget")
+    if found:
+        alias_candidates.append(found)
+    alias_candidates.append(str(get_windowsapps_dir() / "winget.exe"))
+
+    any_exe_present = False
     seen: set[str] = set()
-    for candidate in candidates:
+    for candidate in alias_candidates:
         if not candidate or candidate in seen:
             continue
         seen.add(candidate)
         if not Path(candidate).exists():
             continue
+        any_exe_present = True
         if _winget_runs(candidate):
             _WINGET_CACHE = candidate
             return candidate
 
-    _WINGET_CACHE = ""
+    if any_exe_present:
+        # exe 在但本次没跑通：可能只是冷启动超时，不缓存，下次重试。
+        return ""
+    _WINGET_CACHE = ""  # 磁盘上确实没有 winget.exe，缓存为不可用
     return ""
 
 
@@ -109,7 +130,11 @@ def _run(cmd: str, timeout: int = 8) -> tuple[int, str]:
         if cmd.strip().lower().startswith("winget "):
             winget = find_winget()
             if not winget:
-                return -1, "未检测到 winget。请安装/修复 Microsoft App Installer，或从 Microsoft Store 更新“应用安装程序”。"
+                return -1, (
+                    "未检测到 winget。若已安装却仍报此提示，多半是禁用了 Windows 更新"
+                    "导致应用商店/winget 无法启动：请先恢复 Windows Update、BITS 等服务再重试，"
+                    "或安装/修复 Microsoft App Installer。"
+                )
             cmd = f'"{winget}" {cmd.strip()[len("winget "):]}'
         result = subprocess.run(
             cmd,
@@ -221,7 +246,10 @@ def check_winget_available() -> tuple[bool, str]:
     """检查 winget 本身是否可用"""
     winget = find_winget()
     if not winget:
-        return False, "未检测到 winget。请安装/修复 Microsoft App Installer。"
+        return False, (
+            "未检测到 winget。若电脑禁用了 Windows 更新，会导致应用商店/winget 无法启动，"
+            "请先恢复 Windows Update 相关服务再重试；否则请安装/修复 Microsoft App Installer。"
+        )
     code, out = _run("winget --version")
     if code == 0 and out.strip():
         return True, _extract_version(out)

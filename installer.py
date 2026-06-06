@@ -36,6 +36,33 @@ def _is_progress_line(line: str) -> bool:
     return False
 
 
+def _is_network_failure(returncode: int, output: str) -> bool:
+    """winget 下载阶段的网络不可达失败。
+
+    GitHub 被墙/无代理时 winget 报 InternetOpenUrl() failed / 0x80072efd，
+    退出码为 0x80072EFD(2147954429)。识别后给出明确的“连代理”提示，
+    而不是只甩一个退出码让用户一头雾水。
+    """
+    if returncode in (2147954429, 2147954429 - 2**32):  # 0x80072EFD
+        return True
+    lowered = output.lower()
+    return any(m in lowered for m in ("internetopenurl", "0x80072efd", "0x80072ee"))
+
+
+def _is_msix_deploy_failure(returncode: int, output: str) -> bool:
+    """MSIX/AppX 部署阶段失败。
+
+    下载与哈希校验都通过了(日志已出现“已成功验证安装程序哈希/正在启动程序包安装”),
+    随后报 0x80070002(文件找不到)或底层 0x80073CF1(Package was not found)。
+    常见于精简版/LTSC、卸载了 Microsoft Store 或禁用 Windows 更新的系统:AppX 部署服务
+    或框架依赖(VCLibs/UI.Xaml)不可用,winget 下载得到却无法把 MSIX 部署上去。
+    """
+    if returncode in (2147942402, 2147942402 - 2**32):  # 0x80070002
+        return True
+    lowered = output.lower()
+    return any(m in lowered for m in ("0x80070002", "0x80073cf1", "package was not found"))
+
+
 def _winget_no_update(returncode: int, output: str) -> bool:
     """winget 对“已安装且无升级”会返回非 0,这里把它视为已满足。"""
     if returncode not in (WINGET_NO_APPLICABLE_UPDATE, WINGET_NO_APPLICABLE_UPDATE_SIGNED):
@@ -187,6 +214,15 @@ def install_stream(install_cfg: dict) -> Iterator[str]:
         yield f"[完成] {target} 安装/更新成功"
     elif itype == "winget" and _winget_no_update(proc.returncode, "\n".join(output_lines)):
         yield f"[完成] {target} 已安装,当前没有可用更新"
+    elif itype == "winget" and _is_network_failure(proc.returncode, "\n".join(output_lines)):
+        yield f"[失败] {target} 无法连接下载服务器(GitHub)。"
+        yield "[原因] 网络无法访问 github.com,错误码 0x80072efd;多为被墙/无代理或公司网络拦截。"
+        yield "[修复] 连接代理 / VPN 后重试,或换一个能打开 github.com 的网络环境再安装。"
+    elif itype == "winget" and _is_msix_deploy_failure(proc.returncode, "\n".join(output_lines)):
+        yield f"[失败] {target} 已下载校验通过,但系统无法部署 MSIX 应用。错误码 0x80070002。"
+        yield "[原因] 多为精简版/LTSC、卸载了 Microsoft Store 或禁用 Windows 更新,导致 AppX 部署服务/框架依赖缺失。"
+        yield "[修复] 管理员 PowerShell 运行 Repair-WinGetPackageManager -Latest -Force 后重试;并确认未禁用 AppXSvc 与 Windows 更新服务。"
+        yield "[备用] 也可在普通(非管理员)PowerShell 手动执行 winget install,或从 Microsoft Store / 官方发布页安装 Windows Terminal、PowerShell。"
     else:
         yield f"[失败] {target} 退出码: {proc.returncode}"
 
